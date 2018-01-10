@@ -1,2 +1,2 @@
 # study-notes
-Here just some notes after my code study :)
+Here are just some notes after my code study :)
