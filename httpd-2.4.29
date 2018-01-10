@@ -1,0 +1,167 @@
+- read configuration file and do parsing we can check the function ap_build_config_sub:
+    * conftree collects all parsing results
+    * In main function, this part is in ap_read_config -> ap_process_resource_confi
+- configurations are setup in the function invoke_command:
+    * It seems like configurations are set in callbacks, and the entry point is in the switch case
+    * In main function, this part is in ap_process_config_tree
+- command_rec arrays register those function callback for configuration processing:
+    * Some can be seen in core.c, core_cmds[], with MACRO AP_INIT_XXX
+- Almost all hook parts are written in MACRO, register part is in each module file:
+    * For example we can check register_hooks function in the file core.c
+    * The function body of ap_hook_type_checker is written by the MACRO AP_IMPLEMENT_HOOK_RUN_FIRST => APR_IMPLEMENT_EXTERNAL_HOOK_BASE(ns,link,name)
+      HOOK_BASE function is the body of ns##_hook_##name
+       #0  0x0000000000445967 in ap_hook_type_checker (pf=pf@entry=0x43c290 <do_nothing>, aszPre=aszPre@entry=0x0, aszSucc=aszSucc@entry=0x0, nOrder=nOrder@entry=30) at request.c:85
+       #1  0x000000000044123f in register_hooks (p=0x6a5138) at core.c:5355
+       #2  0x000000000044fe29 in ap_add_module (m=0x69a900 <core_module>, p=0x6a5138, sym_name=<optimized out>) at config.c:640
+       #3  0x00000000004501d8 in ap_setup_prelinked_modules (process=process@entry=0x6a3218) at config.c:798
+       #4  0x000000000042aa61 in main (argc=1, argv=0x7fffffffe698) at main.c:487
+    * mod_example_hooks can be checked   
+    * Therefore, all hook functions are registered in ap_hook_xxx, and are executed at ap_run_xxx 
+    * Later I found that apache website has tutorial about how to create a module, we can check them for details.
+- mpm entry function is event_run
+    * retained->mpm->my_generation is incremented inside event_run and after server_main_loop (each time we leave the server_main_loop)
+    * ap_fatal_signal_setup registers sig_coredump for signals SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE (use man 7 signal to get details)
+    * in ap_unixd_mpm_set_signals, we register:
+       SIG_IGN to SIGPIPE, SIGXFSZ;
+       SIG_DFL to SIGXCPU;
+       sig_term to SIGTERM, SIGINT, AP_SIG_GRACEFUL_STOP;
+       sig_restart to SIGSTOP, AP_SIG_GRACEFUL  
+    * if !retained->mpm->was_graceful, we directly call startup_children and make_child (make remaining_children_to_start children), otherwise, set retained->hold_off_exponential_spawning = 10
+    * then enter server_main_loop:
+       Before entering server_main_loop, retained->mpm->mpm_state = AP_MPMQ_RUNNING, after leaving server_main_loop, retained->mpm->mpm_state = AP_MPMQ_STOPPING
+    * if retained->mpm->shutdown_pending && retained->mpm->is_ungraceful
+       Scan all buckets and call ap_mpm_podx_killpg (pod = pipe of death) with argument AP_MPM_PODX_RESTART     
+       Call ap_reclaim_child_processes, this function do the following routine:
+         action_table[] = {
+                            {DO_NOTHING, 0}, /* dummy entry for iterations where we reap
+                                          * children but take no action against
+                                          * stragglers
+                                          */
+                            {SEND_SIGTERM_NOLOG, 0}, /* skipped if terminate == 0 */
+                            {SEND_SIGTERM, apr_time_from_sec(3)},
+                            {SEND_SIGTERM, apr_time_from_sec(5)},
+                            {SEND_SIGTERM, apr_time_from_sec(7)},
+                            {SEND_SIGKILL, apr_time_from_sec(9)},
+                            {GIVEUP,       apr_time_from_sec(10)}
+                         };
+         each action will be take after the specified interval, and for each action, reclaim_one_pid will be called for each valid daemon, and if the reclaim is valid then event_note_child_killed function will be called.
+         this function is in a do-while loop and basically we want all processes to be terminated before leaving this function.
+         event_run is returned here ...
+    * if retained->mpm->shutdown_pending && !retain->mpm->is_ungracefull, this means graceful shutdown ...
+       Call ap_close_listeners, scan through all listener_records and close the sockets
+       Scan all buckets and call ap_mpm_podx_killpg with argument AP_MPM_PODX_GRACEFUL
+       ap_relieve_child_processes is called, this function is similar to ap_reclaim_child_processes but we don't take any action if the processes are not terminated, and no big do-while loop to keep trying
+       Then we still scan each process and call ap_mpm_safe_kill in a do-while loop until cutoff timeout happened or all processes are inactive?
+       Then remaining routine is somewhat like ungraceful shutdown and event_run is returned here ... 
+    * if !retained->mpm->is_ungraceful or else (Is this for restart_pending?)
+       Call ap_mpm_podx_killpg for all buckets ... not really tracing this part in detail ...
+- server_main_loop(remaining_children_to_start, num_buckets)
+    * The whole function is a while loop (!retained->mpm->restart_pending && !retained->mpm->shutdown_pending)
+    * First calling ap_wait_or_timeout to know if there's a terminated process
+    * If there's a terminated process, if (pid.pid != -1)
+       Call ap_process_child_status to know whether APEXIT_CHILDSICK, APEXIT_CHILDFATAL or APEXIT_OK (return 0)
+       Call ap_find_child_by_pid to get child_slot, which is the index in ap_scoreboard_image->parent[] array
+       Using child_status to judge if we have to leave the main loop or set corresponding indicator such as retained->sick_child_detected
+       If this process is normally terminated, we update child status for all threads in this child using ap_update_child_status_from_indexes, update ap_scoreboard_image->servers[child_num][thread_num]
+       If this process is normally terminated, we make a new child directly, 1-for-1 replacement, if we got sick_child_detected then we set idle_spawn_rate = 1
+    * If there's no terminated process and we have remaining_children_to_start > 0, then we call startup_children and create #remaining_children_to_start child processed
+    * When there's no child died and no remaining children to start, we call perform_idle_server_maintenance for each bucket    
+- perform_idle_server_maintenance(int child_bucket, int num_buckets)
+    * Calulate all idle worker threads belong child_bucket, calculate all active threads
+    * If idle_thread_count > max_spare_threads / num_buckets, kill this child and set retained->idle_spawn_rate[child_bucket] = 1
+    * If idle_thread_count < min_spare_threads / num_buckets, and if there's free slot, then we spawn new children ...
+    * Not only the two cases above, in other cases, we may set warning logs, set idle_spawn_rate to 1 or increase, or do other things ...
+- make_child(server_rec *s, int slot, int bucket)
+    * This function forks a new process and then:
+    * For parent process we update ap_scoreboard_image->parent[slot], call event_note_child_started (ap_run_child_status hook ), increase active_daemons and retained->total_daemons
+    * For child process, it calls child_main and should never return
+- child_main(int child_num_arg (this is slot), int child_bucket (this is bucket))
+    * Create a new pool pchild
+    * Close all unused listeners and pods, because now we are in a new process, ap_close_listeners_ex and ap_mpm_podx_close
+    * Create g_timer_skiplist_mutex, init timer_free_ring, timer_skip_list
+    * Call apr_setup_signal_thread, let all threads only handle synchonization signals, calling pthread_sigmask(SIG_SETMASK, &sig_mask, NULL)
+    * Call apr_thread_create with routine starts_thread and argument ts (struct thread_starter)
+    * For original thread, in while(1) we call ap_mpm_podx_check and if the result is AP_MPM_PODX_GRACEFUL || AP_MPM_PODX_RESTART (ungraceful), we call join_start_thread and signal_threads
+       start_thread is the thread we call apr_thread_create
+       in signal_threads we call wakeup_listener and if we are in ungraceful mode, we call ap_queue_interrupt_all and close_worker_sockets
+        in wakeup_listener, call apr_pollset_wakeup, ap_queue_info_term (set queue_info->terminated = 1, conditional var broadcast to worker_queue_info) and send it LISTENER_SIGNAL
+        in ap_queue_interrupt_all, call apr_thread_cond_broadcast to worker_queue
+    * After leaving the while(1), we call join_workers(ts->listeners, threads) to join the listener thread and all worker threads
+    * Because we already receive termination instruction, call clean_child_exit to terminate this process   
+- start_threads(apr_thread_t *thd, void *dummy)
+    * Create worker_queue, worker_queue_info and timeout_mutex
+    * Create event_pollset, and it should also set listener_is_wakeable as 1
+    * Create worker_sockets
+    * In the while(1) loop
+       for i < threads_per_child and ap_scoreboard_image->servers[my_child_num][i].status != SERVER_DEAD, update child status and call apr_thread_create, routine is worker_thread, argument is my_info
+       If there's a thread created and currently no listener thread, then we call create_listener_thread, routine is listener_thread, argument is my_info
+       Basically we break this loop when we already created #threads_per_child threads, or we got notification to terminate the start thread
+    * When we can leave the while(1) loop, start thread exits with success
+- listener_thread(apr_thread_t *thd, void *dummy)
+    * Call init_pollset
+       Create #num_listensocks of apr_pollfd_t and assign to listener_pollfd, add these pollfd on my_bucket->listeners, set these fd as socket, read, nonblock and add into pollset
+    * Unblock LISTENER_SIGNAL but register a dummy_signal_handler
+    * In the for(;;) main loop:
+       if listener_may_exit is set (by wakeup_listener), then close_listeners is called
+       trace connection_count, clogged_count, write_completion_q->total, keepalive_q->total, lingering_count, suspended_count for each second
+       check timer_skiplist and pop timer timeout events, and push them into worker_queue, use g_timer_skiplist_ntx to protect this region
+       we also update timeout interval using queue_next_expiry
+       call apr_pollset_poll using the timeout_interval we just calculated from timer_expiry and queue_expiry
+       After apr_pollset_poll we get into another while(num) loop, num is the number of active fds:
+         There are two poll types, PT_CSD and PT_ACCEPT
+         In PT_CSD, the states are as following:
+           CONN_STATE_CHECK_REQUEST_LINE_READABLE => CONN_STATE_READ_REQUEST_LINE, we won't wait for a worker for keep-alive request, otherwise we close the connection. This connection state will be removed from ka_q
+           CONN_STATE_WRITE_COMPLETION, we wait for a worker for this request and we remove this connection state from wc_q.
+           For the states above, we call push2worker if we have idle worker thread
+           For CONN_STATE_LINGER_NORMAL and CONN_STATE_LINGER_SHORT, we call process_lingering_close
+         In PT_ACCEPT:
+           check if workers are busy, then call disable_listensocks and set listeners_disabled = 1, otherwise call enable_listensocks
+           if !listeners_disabled, get a transaction pool (create a new one or get from recycled list), call get_worker with blocking and call accept_func (ap_unixd_accept), it returns a new socket
+           with this new socket, we call push2worker for it
+       Check if timeout queues have some events timeout and process all of them: 1) keepalive queue, 2) write_completion queue, 3) linger queue, 4) short linger queue. After processing these queues update the scoreboard
+       for this child process.
+       If there's no timeout queue event and workers are busying or dying, then we kill all keep-alive queue        
+       There're other checks such as defer_linger_chain or enable_listensocks
+       Then we reach the end of main loop
+    *  The time we're going to leave the main loop we will close listeners and call ap_queue_term
+- worker_thread(apr_thread_t *thd, void *dummy)
+    * Update ap_scoreboard_image->servers[process_slot][thread_slot] and call ap_update_child_status_from_indexes
+    * In the loop while(!workers_may_exit), calling signal_thread with ungraceful termination can break this loop
+        if current_worker is idle, call ap_queue_info_set_idle, which will update queue_info->idlers and signal the condition variable queue_info->wait_for_idler, effective for ap_queue_info_wait_for_idler                   
+        call ap_queue_pop_something, in this function we may block inside, and we first check/handle the timer expired event and then the socket, we call process_socket to handle it    
+        then there's another while loop for processing defer_liger_chain (check listener_thread), sockets will be processed also by calling process_socket
+        then we reach the end of the while(!workers_may_exit) loop
+    * Outside the loop, we call ap_update_child_status_from_indexes for SERVER_DEAR or SERVER GRACEFUL and exit this thread with APR_SUCCESS    
+- process_socket(apr_thread_t *thd, apr_pool_t *p, apr_socket_t *sock, event_conn_state_t *cs, int my_child_num, int my_thread_num)
+    * If this is a new connection (event_conn_state_t *cs == NULL), allocate a new event connection type and connection rec, set state as CONN_STATE_READ_REQUEST_LINE
+    * If this is not a new connection, we update the connection record (different thread and connection ID), if c->aborted is set then the state becomes CONN_STATE_LINGER
+    * Then if the state is not CONN_STATE_LINGER, and we have c->clogging_input_filters == true or state = CONN_STATE_READ_REQUEST_LINE, we call ap_run_process_connection
+    * Then if the state is CONN_STATE_WRITE_COMPLETION, first we get the last output filter and call output_filter->frec->filter_func->out_func, then:
+       if c->data_in_output_filter is set, means we still in WRTIE COMPLETION STATE, we add this pfd into wc_q, suspend this connection and add it back into pollset
+       if this connection is not keep-alive, or its aborted flag is set, set CONN_STATE_LINGER
+       if c->data_in_input_filter is set, state becomes CONN_STATE_READ_REQUEST_LINE, goto read_request label, which means to call ap_run_process_connection
+       else we set the state to CONN_STATE_CHECK_REQUEST_LINE_READABLE
+    * Then if the state is in CONN_STATE_LINGER, we call start_lingering_close_blocking
+       else if the state is CONN_STATE_CHECK_REQUEST_LINE_READABLE, suspend the connection, add this pfd into pollset, push this cs into ka_q
+       else if the state is CONN_STATE_SUSPEND, just call notify_suspend and update the suspend_count, it seems like only ap_process_async_request can change the state to CONN_STATE_SUSPEND                     
+- notify_suspend(event_conn_state_t *cs)
+    * Call ap_run_suspend_connection and set cs->suspended = 1, and reset cs->c->sbh = null          
+- start_lingering_close_blocking(event_conn_state_t *cs) 
+    * Call ap_start_lingering_close and if it returns true, then we close this socket and this connection is fully closes, return here
+    * Otherwise, we increase the lingering_count, push this connection into short_linger_q (becomes CONN_STATE_LINGER_SHORT) or linger_q (becomes CONN_STATE_LINGER_NORMAL)   
+- ap_start_lingering_close(conn_rec *c)
+    * Call ap_prep_lingering_close, which runs the pre_close_connection hook
+    * Call ap_flush_conn, which calls ap_shutdown_conn, there're thing related to buckets and brigade ...
+    * Call ap_socket_close or ap_socket_shutdown ...    
+- ap_set_listener(cmd_parms *cmd, void *dummy, int argc, char *const argv[])
+    * This function is the callback function for LISTEN configuration parsing, and it calls alloc_listener
+- alloc_listener(process_rec *process, const char *addr, apr_port_t port, const char *proto, void *slave)
+    * If the addr and port is not used by others, create a new sockaddr_t and listen_rec and append it into ap_listeners    
+- ap_setup_listeners(server_rec *s)
+    * It seems like one server_rec can have multiple address, maybe we can check get_addresses in server/vhost.c
+    * For each server, first we try to set protocol for all of them by calling ap_set_server_protocol
+    * Call open_listeners, this function create, open, listen and bind listener sockets   
+- event_open_logs(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp, server_rec *s)
+    * num_listensocks is got by calling ap_setup_listeners and its value is from the length of ap_listeners
+    * Call ap_duplicate_listeners, duplicate ap_listeners to each bucket
+    * Allocate all_buckets and assign listeners to it
