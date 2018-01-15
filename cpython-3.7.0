@@ -1,0 +1,174 @@
+* Objects are structures allocated on the heap. Special rules apply to the use of objects to ensure
+  they are properly garbage-collected. Objects are never allocated statically or on the stack. but Type
+  objects are exceptions to it, standard types are represented by statically initialized type objects.
+
+* Once allocated an object keeps the same size and address. Not all objects of the same type have the same
+  size. And nothing is actually declared as a PyObject, but every pointer to a python object can be cast
+  to a PyObject*. This is inheritance build by hand.
+
+* typedef struct _object {
+    struct _object *_ob_next;
+    struct _object *_ob_prev;
+    Py_ssize_t ob_ref_cnt;
+    struct _typeobject *ob_type;
+} PyObject;
+
+* struct _typeobject is also in object.h, this is the main structure of an object:
+    - tp_name is for printing, in format "<module>.<name>"
+    - tp_basicsize, tp_itemsize are for allocation
+    - typedef void (*destructor)(PyObject *) tp_dealloc, 
+      typedef int (*printfunc)(PyObject *, FILE *, int) tp_print, ... name with postfix func are fp
+    - PyAsyncMethods has three fps called am_await, am_aiter, am_anext  
+    - PyNumberMethods for all number related operations
+    - PySequenceMethods for len, concat, repeat, slice, ...
+    - PyMappingMethods has mp_length, mp_subscript, mp_ass_subscript
+    - hash, call, str, getattr, set attr, init, new, ...
+
+* Python has another object type, based on PyObject, to represent like variable-sized objects:
+
+* typedef struct {
+    PyObject ob_base;
+    Py_ssize_t ob_size; /* Number of items in variable part */
+} PyVarObject
+
+* Let's see the long integer object inteface:
+
+* typedef struct _longobject PyLongObject;
+  struct _longobject {
+     PyVarObject ob_base;
+     digit ob_digit[1]; /* digit is uint32 */
+  }
+
+* And for PyLongObject, its PyTypeObject(struct _typeobject) points to PyLong_Type, we can see that
+  its tp_name is 'int', tp_basicsize is offsetof(PyLongObject, ob_digit), tp_itemsize = sizeof(digit),
+  besides, it this type implement some operations, the callback will be there ...
+
+* Regarding to the number operation, we can check long_as_number (pointed by tp_as_number), it is an
+  array of type PyNumberMethods and it has function pointers such as nb_add, nb_multiply, ...
+
+* PyLongType (and others) has an var object pointing to PyType_Type and it has an var object pointing to
+  itself
+
+* When the object's refcnt = 0, it will call tp_dealloc fp, but type object won't be dealloc
+
+* for long type, python keeps NSMALLPOSINT and NSMALLNEGINT and in this range we preallocate an array for
+  optimization. When long object is allocated, the size is offsetof(PyLongObject, ob_digit) + 
+  sizeof(digit) * size
+  
+* For methods of each types, we can check the static array of type PyMethodDef:
+    - struct PyMethodDef {
+        const char *ml_name; /* the name of the built-in function/method */
+        PyCFunction ml_meth; /* the C function that implements it */
+        int ml_flag;         /* mostly describes the args needs for this C function */
+        const char *ml_doc;  /* The __doc__ attribute, or NULL */
+    }
+  
+* PyUnicode_Type is the 'str' type, and the new object was allocated in PyUnicode_New, it checks whether
+  the char_size is 1, 2 or 4 (is_sharing = 1, in 2 or 4 cases) then object = PyObject_MALLOC(struct_size +
+  (size + 1) * char_size). struct_size = sizeof(PyCompactUnicodeObject), or sizeof(PyASCIIObject).
+  PyASCIIObject is used only when char_size = 1. 
+
+* If checking unicodeobject.h, we'll see actually there're 4 forms of Unicode string:
+    - PyASCIIObject (compact ascii)
+    - PyCompactUnicodeObject (compact)
+    - PyUnicodeObject (legacy string, not ready)
+    - PyUnicodeObject (legacy string, ready)
+    - compact strings use only one memory block, legacy string use 1 memory block and 1 char block 
+    - legacy strings are created by PyUnicode_FromUnicode and PyUnicode_FromStringAndSize
+    - we can check the site http://legacy.python.org/dev/peps/pep-0393/ and it said the recommended
+      way to create a Unicode object is to use Py_Unicode_New now
+
+* PyCompactUnicodeObject has a PyASCIIObject inside
+
+* typedef struct {
+    PyVarObject ob_base;
+    PyObject *ob_item[1];
+  } PyTupleObject;
+
+* Tuple objects use _PyObject_VAR_SIZE (returns typeobj->tp_basicsize + typeobj->itemsize * nitems) to
+  allocate its memory (this marco should also be used by other variable sized object). This is called by
+  Py_Tuple_New and when it returns, we can assign object iteratively to ob_item[i]
+
+* Tuple objects (and list objects ...maybe more) have static freelist array pointing to objects to save
+  the times for malloc.
+  
+* typedef struct {
+    PyVarObject ob_base;   /* ob_size means the actual elements inside */
+    PyObject **ob_item;    /* it points to a space for allocated elements*/
+    Py_ssize_t allocated;  /* this is to describe the size of allocated space */
+  } PyListObject;
+    - this struct design means that when the elements increase, we can reallocate a bigger space
+
+* typedef struct {
+    PyObject ob_base;        /* not variable type, why? not important? */
+    Py_ssize_t ma_used;
+    uint64_t ma_version_tag; /* dictionary version, globally unique, value changes each modified */
+    PyDictKeysObject *ma_keys;
+    PyObject **ma_values;    /* if NULL, pairs are in ma_keys (combined), otherwise stored separately */
+  } PyDictObject
+
+* struct _dictkeysobject {
+    Py_ssize_t dk_refcnt;
+    Py_ssize_t dk_size;          /* size of the hash table, must be power of 2 */
+    dict_lookup_func dk_lookup;  /* lookdict(), lookdict_unicode(), lookdict_unicode_nodummy, lookdict_split */
+    Py_ssize_t dk_usable;        /* number of usable entries in dk_entries */
+    Py_ssize_t dk_nentries;      /* number of used entries in dk_entries */
+    union {
+        int8_t as_1[8];
+        int16_t as_2[4];
+        int32_t as_4[2];
+        int64_t as_8[1]'
+    } dk_indices;
+  }
+    - dk_indices is the head of array of indices and dk_enties follows. See details as the top of dictobject.c
+    - dk_indices is the actual hash table, it holds index in entries array or DKIX_EMPTY(-1), DKIX_DUMMY(-2)
+    - Because dk_indices entry can hold negative numbers, for dk_size <= 127, we can use 'as_1'; for 
+      dk_size <= 2**15, we can use 'as_2'  
+ 
+* typedef struct {
+    Py_hash_t me_hash; /* cached hashed code of me_key*/
+    PyObject *me_key;
+    PyObject *me_value; 
+  } 
+
+* PyDict_GetItem(PyObject *op, PyObject *key)
+    - when key is not PyUnicode_Type, or ((PyASCIIObject *) key)->hash == -1, we use PyObject_Hash(key) as
+      hash
+    - then we have ix = (mp->ma_keys->dk_lookup)(mp, key, hash, &value)
+
+* In PyDict_SetItem, it calls insertdict(mp, key, hash, value) and we may call insertion_resize then
+  dictresize to restructure the table by allocating a new table and reinserting all items again   
+
+* typedef struct {
+    PyObject ob_base;
+    int co_argcount;         /* arguments, except *arg */
+    int co_kwonlyargcount;   /* keyword only argument, like c in def foo(a, b, *, c):, then we have to use
+                                foo('a', 'b', c='c'), check PEP3102, they're arguments that can only be supplied by 
+                                keyword and which will never be automatically filled in by a positional argument */
+    int co_nlocals;          /* local variables */
+    int co_stacksize;        /* entries needed for evaluation stack */
+    int co_flags;            /* use dis.COMPILER_FLAG_NAME, 1: OPTIMIZED, 2:NEWLOCALS, 4:VARARGS, 8:VARKEYWORDS, 16:NESTED, 32:GENERATOR, ...*/
+    int co_firstlineno;      /* first source line number */
+    PyObject *co_code;       /* instruction op code, bytes type */
+    PyObject *co_const;      /* tuple for constants, any code object inside current code object will be listed here!!! */
+    PyObject *co_names;      /* tuple of strings, used function name? */
+    PyObject *co_varnames;   /* tuple of strings of local variable names */
+    PyObject *co_freevars;   /* tuple of strings of free variable names, free variable is a variable from an outer function */
+    PyObject *co_cellvars;   /* tuple of strings of cell variable names, cell variable is a variable used by inner function */
+    /* The rest aren't used in either hash or comparisons, except for co_name used in both */
+    Py_ssize_t *co_cell2arg; /* Map cellvars which are arguments, a pointer to an array and each entry stores the index in total arguments */
+    PyObject *co_filename;   /* unicode (where it was loaded from) */
+    PyObject *co_name;       /* unicode, the name of the code block */
+    PyObject *co_lnotab;     /* pairs of (pyc code, source code) in byte string, afterward pair is coded with difference to the previous one */
+    ...  
+  } PyCodeObject;
+    - PyCodeObject is the whole code object, there's no other field with it for memory allocation (PyCode_New)
+    - it has code_memberlist which registers most of its methods like co_argcount, co_keyonlyargcount, ...
+
+* typedef struct PyMemerDef {
+    const char *name; /* name of the method */
+    int type;         /* return type of the method */
+    Py_ssize_t;       /* the wanted value's byte offset in code object */
+    int flag;         /* READONLY in code object */
+    const char *doc;  /* not used in code object */
+  } PyMemberDef
