@@ -172,3 +172,200 @@
     int flag;         /* READONLY in code object */
     const char *doc;  /* not used in code object */
   } PyMemberDef
+
+* frame object can be got in python by calling sys._getframe()
+
+* typedef struct _frame {
+    PyVarObject ob_base;
+    struct _frame *f_back;  /* previous from, or NULL */
+    PyCodeObject *f_code;   /* code segment */
+    PyObject *f_builtins;   /* builtin symbol table, PyDictObject */
+    PyObject *f_globals;    /* global symbol table, PyDictObject */
+    PyObject *f_locals;     /* local symbol table, PyDictObject */
+    PyObject **f_valuestack; /* point after the last local, stack with highest address */
+    PyObject **f_stacktop;   /* next free slot in f_valuestack, frame creation sets to f_valuestack */
+    PyObject *f_trace;     /* trace function, is a function called at the start of each source code line, for debugger */
+    char f_trace_lines;    /* emit per-line trace events? */
+    char f_trace_opcodes;  /* emit per-line trace opcode? */
+    PyObject f_gen;        /* borrowed reference to a generator, or NULL, for running generator code */
+    int lasti;             /* last instruction if called, index into the bytecode string of the code object */
+    int f_lineno;          /* current line number but only valid when f_trace is valid, so call PyFrame_GetLineNumber() */
+    int f_iblock;          /* index_in_f_blockstack */
+    char f_executing;      /* whether the frame is still executing */
+    PyTryBlock f_blockstack[CO_MAXBLOCKS]; /* for try and loop blocks */
+    PyObject f_localsplus[1]; /* locals + stack, dynamically sized */ 
+  } PyFrameObject;
+
+* typedef struct {
+    int b_type;      /* what kind of block this is */
+    int b_handler;   /* where to jump to find handler */
+    int b_level;     /* value stack level to pop to */
+  } PyTryBlock;
+
+* PyFrame_New calls _PyFrame_New_NoTrack(PyThreadState *tstate, PyCodeObject *code, PyObject *globals, PyObject *local)
+    - the allocate size is ncells (PyTuple_GET_SIZE(code->cellvars)) + nfrees (PyTuple_GET_SIZE(code->co_freevars)), 
+      then set f->code = code, set f_valuestack = f_localsplus + ncells + nfrees + code->co_nlocals, ...
+    - set f->lasti = -1, f_lineno = code->co_firstlineno, f->globals = globals
+    - if back == NULL || back->globals != globals, we check if globals has builtin module and use its dict for f->builtins
+      otherwise we create a new dict
+    - if code->co_flags has CO_NEWLOCALS, we set f->locals a new dict, otherwise we set f->locals = globals   
+
+* typedef struct {
+    PyObject_HEAD;           
+    PyObject *md_dict;           /* __dict__ of this module */ 
+    struct PyModuleDef *md_def;  /* initialized and set in _PyModule_CreateInitialized, */
+    void *md_state;              /* points to a memory space with size = md_def->m_size, each module has its usage */
+    PyObject *md_weaklist;
+    PyObject *md_name;           /* module name */
+  } PyModuleObject;
+  - PyModule_New calls PyModule_NewObject(nameobj) and it creates a PyModuleObject based on PyModule_Type, then
+    it sets md_def, md_state, md_weaklist, md_name as NULL, but call module_init_dict for md_dict
+  - module_init_dict pushes __name__, __doc__, __package__, __loader__, __spec__ into md_dict but only __name__
+    has a value, others are NULL    
+
+* typedef struct {
+    PyModuleDefBase m_base; /* always initialize this member to PyModuleDef_HEAD_INIT */
+    const_char *m_name;     /* name for the new module */
+    const_char *m_doc;      /* docstring for the module */
+    Py_ssize_t m_size;      /* module state may be kept in a per-module memory area that can be retrieved
+                               with PyModule_Getstate(), rather than in static globals. This makes modules
+                               safe for use in multiple sub-interpreters. This memory is allocated based on it */
+    PyMethodDef *m_methods; /* a pointer to a table of module-level functions, it can be NULL */
+    struct PyModuleDef_Slot *m_slots; /* an array of slot definitions for multi-phase initialization */
+    traverseproc m_traverse;  /* a traversal function to call during GC traversal of the module object */
+    inquiry m_clear;          /* a clear function to call during GC clearing of the module object */
+    freefunc m_free;          /* a function to call during deallocation of the module object */
+  } PyModuleDef;
+  - sub-interpreters allow to create several independent interpreters in the same process and perhaps even in
+    the same thread, it is an almost totally separate environment for the execution of Python code. See details
+    in https://docs.python.org/3/c-api/init.html#sub-interpreter-support
+
+* typedef struct PyModuleDefBase {
+    PyObject_HEAD;
+    PyObject* (*m_init)(void);
+    Py_ssize_t m_index;
+    PyObject *m_copy;
+  } PyModuleDef_Base;
+
+* typedef struct _is {
+    struct _is *next;            /* Ex: at PyInterpreterState_New, all interpreters will be link to _PyRuntime.interpreters.head */
+    struct _ts *tstate_head;     /* Ex: when new_threadstate(*interp, init) is called, new PyThreadstate will be linked to */
+    int64_t id;                  /* each interpreter has its unique id, set in PyInterpreterState_New using _Pyruntime.interpreters.next_id */
+    PyObject *modules;           /* Ex: init in _PyInitializeCore, it's a dict  */
+    PyObject *modules_by_index;  /* a PyList, use module->m_base.m_index as index to get item */
+    PyObject *sysdict;           /* this is a dictionary from sysmodule, seems like all imported module will be here */ 
+    PyObject *builtins;          /* Ex: builtin module initialized in _PyInitializeCore, and this points to its dict  */ 
+    PyObject *importlib;         /* Ex: at initimport, it points to a module named "_frozen_importlib" */
+    int check_interval;          /* used in Python/sysmodule.c, indicate python interpreter to check asynchronous event every n (100) instructions */
+    long num_threads;            /* used in Modules/_threadmodule.c, initialzied to 0 and record the current number of threads */
+    size_t  pythread_stacksize   /* Support for runtime thread stacksize tuning, 0 means default size */
+    PyObject *codec_search_path;     /* List, initialize in _PyCodecRegistry_Init, it's about string codec */
+    PyObject *codec_search_cache;    /* same as above but it's a dict */
+    PyObject *codec_error_registry;  /* same as above, a dict */
+    int codecs_initialized;
+    int fscodecs_initialized;
+    _PyCoreConfig core_config;         /* from pymain->config, assigned by _PyCoreConfig_Copy, related to environment setup */
+    _PyMainInterpreterConfig config;   /* it holds data for calling sys.path, sys.argv, ... methods under interpreter */
+    int dlopenflags;
+    PyObject *builtins_copy;     /* Ex: a backup of builtins, in _PyImport_Init we see interp->builtins_copy = Pydict_copy(interp->builtins) */
+    PyObject *import_func;       /* Ex: from initimport, interp->import_func = PyDictGetItemString(interp->builtins, "__import__") */
+    _PyFrameEvalFunction eval_frame;
+    Py_ssize_t co_extra_user_count;
+    freefunc co_extra_freefunc[MAX_CO_EXTRA_USERS];
+    PyObject *before_forkers;
+    PyObject *after_forkers_parent;
+    PyObject *after_forkers_child;
+    void (*pyexitfunc)(PyObject *);
+    PyObject *pyexitmodule; 
+  } PyInterpreterState;
+
+* Python's name resolution are determined after compiling and if follows local => enclosure => global (the module file) => builtins (intrisic)
+
+* the whole python program starts at Programs/python.c and it has two entry functions, wmain(windows) and main (Unix) and main calls 
+  _Py_UnixMain(argc, argv)
+    - then it calls pymain_main(&pymain), this function processes cmd_line, calls _Py_InitializeCore(see below) and then pymain_run_python(pymain)
+    - then it depends on our input arguments, if pymain->command (-c), call pymain_run_command; else if pymain->module (-m), call pymain_run_module
+      else (without -c and -m), we call pyname_run_filename(pymain, &cf), cf is PyCompilerFlag type ------> I follow this path
+    - if pymain->filename is a package and there's a __main__.py inside, then we run pymain_run_main_from_importer, otherwise we call
+      pymain_run_file(fp, pymain->filename, cf). fp can be stdio (interative mode) or real filename ------> I follow this path       
+    - we call PyRun_AnyFileExFlags(fp, filename_str, filename != NULL, p_cf). filename_str = "<stdin>" at interative mode
+    - if we are in interative mode, we call PyRun_InterativeLoopFlags(fp, filename, flags); otherwise we call 
+      PyRun_SimpleFileExFlags(fp, filename, closeit, flags). -----> I follow this path
+
+* _Py_InitializeCore(const _PyCoreConfig *core_config)
+    - call _PyRuntime_Initialize, then _PyRuntimeState_Init(&_PyRuntime), this function can only called one and _PyRuntime is a global variable,
+      then we get into _PyRuntimeState_Init_impl(&_PyRuntime) and we call _PyGC_Initialize(&runtime->gc) and _PyEval_Initialize(&runtime->ceval)
+    - call _PyMem_SetupAllocators(core_config->allocator), _PyHashRandomization_Init(core_config), _PyInterpreterState_Enable(&_PyRuntime),
+      interp = PyInterpreterState_New(), _PyCoreConfig_Copy(&interp->core_config, core_config), tstate = PyThreadState_New(interp), 
+      PyThreadState_Swap(tstate), _PyEval_FiniThreads(), _PyGILState_Init(interp, tstate), _Py_ReadyTypes(), ... (Lots of initialization)
+
+* PyRun_SimpleFileExFlags(FILE *fp, const char *filename, int closeit, PyCompilerFlags *flags)
+    - call m = PyImport_AddModule("__main__"), this function calls PyImport_AddModuleObject(nameobj), it gets PyThreadState_GET()->interp->modules
+     (a dict) and pass it into _PyImport_AddModuleObject(names, object), this function find the name from the module, or create a new module object 
+     , set this new object into the module dict and return.
+    - set __file__ = filename, __cached__ = None, and check if its a pyc file (call run_pyc_file), or call PyRun_FileExFlags 
+
+* PyRun_FileExFlags(FILE *fp, const char *filename_str, int start, PyObject *globals, PyObject *locals, int closeit, PyCompilerFlags *flags)    
+    - it has mod_ty mod = PyParser_ASTFromFileObject(fp, filename, NULL, start, 0, 0, flags, NULL, arena), AST means Abstract Syntax Tree
+    - call run_mod(mod, filename, globals, locals, flags, arena)
+
+* run_mod(mod_ty *mod, PyObject *filename, PyObject *globals, PyObject *locals, PyCompilerFlags *flags, PyArena *arena)
+    - let PyCodeObject co = PyAST_CompileObject(mod, filename, flags, -1, arena)
+    - then call PyEval_EvalCode((PyObjects*) co, globals, locals), this function then call PyEval_EvalCodeEx(co, globals, locals, 0 ...) then
+      it turns to _PyEval_EvalCodeWithName(co, globals, locals, 0 ...)
+     
+* _PyEval_EvalCodeWithName(PyObject *co, PyObject *globals, PyObject *locals, PyObject * const *kwnames, PyObject * const *kwargs, 
+                           Py_ssize_t kwcount, int kwstep, PyObject * const *defs, Py_ssize_t defcount, PyObject * kwdefs, 
+                           PyObject *closure, PyObject *name, PyObject *qualname)
+    - Get current thread state using PyThreadState_GET()
+    - Create a new frame using _PyFrame_New_NoTrack(tstate, co, globals, locals)
+    - Check compiler flag and if CO_VARKEYWORDS is set, create a kwdict and set f->localsplus[argcount + kwonlyargcount + CO_VARARGS?1:0] = kwdict
+    - for i < MIN(co->co_argcount, argcount), set f->localplus[i]=arg[i],
+    - Create a tuple with argcount - n elements if CO_VARARGS is set, set f->localsplus[argcount + kwonlyargcount] = tuple, and insert into tuple
+    - for each kwnames[i] and kwargs[i], we compare it with each co->co_varnames[j], we set f->localsplus[j] = kwargs[i], or otherwise add it to kwdict
+    - check 1) too many positional args, 2) add missing positional args, 3) add missing kwargs (2 and 3 use default values)
+    - for i < number of co->co_cellvars, if co->co_cell2arg is valid (a cell var is also an argument), clear the local copy and write all cellvars into
+      f->localplus[co->co_nlocals + i]
+    - for i < PyTuple_GET_SIZE(co->cofreevars), copy reference of PyTuple_GET_ITEM(closure, i) into freevars[PyTuple_GET_SIZE(co->co_cellvars) + i]           
+    - if CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR is set, initialize gen = PyCoro_New or PyAsyncGen_New or PyGen_NewWithQualName and if its a
+      coroutine, we call PyObject_CallFunction(coro_wrapper, 'N', gen) and return it, otherwise we return gen
+    - if not GEN/CORO/ASYNCGEN, then we call PyEval_EvalFrameEx(f, 0), and this function returns tstate->interp->eval_frame(f, throwflag) 
+      _PyEval_EvalFrameDefault is called
+        
+* _PyEval_EvalFrameDefault(PyFrameObject *f, int throwflag)
+    - this is where we execute bytecode instructions
+    - call Py_EnterRecursiveCall, which checks recursion_depth of current thread below the limit and also check the stackcheck_counter, ...
+      it returns NULL if not OK
+    - if tstate->use_tracing is set, we may run tstate->c_tracefunc or c_profilefunc and there's a dtrace_function_entry(f) (default off)
+    - Start setting co, names, consts, fastlocals, ...first_instr, next_instr, stack_pointer, f->f_executing = 1, why = WHY_NOT
+    - then we enter the massive for(;;) loop:
+       - check if the eval_breaker is set, this could be set by SET_GIL_GROP_REQUEST, SIGNAL_PENDING_CALLS, SIGNAL_ASYNC_EXC MACROs
+           - if this is true, then we check whether we have these events and do corresponging actions
+           - if _PyRuntime.ceval.pending.calls_to_do is set, we call Py_MakePendingCalls()
+           - if _PyRuntime.ceval.gil_drop_request is set, we call drop_gil(tstate) => Other thread may run now ... => take_gil(tstate)
+           - if tstate->async_exc != NULL, call UNSIGNAL_ASYNC_EXC() 
+       - some other trace support or profiling functions
+       - call NEXTOPARG() to fetch code, and then we go into switch(opcode)
+       - for loop related intructions (BREAK_LOOP, CONTINUE_LOOP), we will goto fast_block_end:, and for other kind or errors/exception we goto error:
+           - In error: label, we set why = WHY_EXCEPTION, call PyTraceBack_Here(f), call call_exc_trace if tstate->c_tracefunc != NULL and we
+             arrive the fast_block_end label:
+           - In fast_block_end label, assert(why != WHY_NOT), it should be WHY_CONTINUE, WHY_BREAK, WHY_EXCEPTION, ... and then we start checking:
+              - we get PyTryBlock *b = f->f_blockstack[f->f_iblock - 1]
+              - if b->type = SETUP_LOOP and why = WHY_CONTINUE, reset next_instr according to retval and break;, if not this case we set
+                f->f_iblock--
+              - then if b->b_type = EXCEPT_HANDLER, call UNWIND_EXCEPT_HANDLER(b), it pops all objects from stack and recover t_state->exc_info,
+                then continue;
+              - call UNWIND_BLOCK(b), pop all values out of current stack
+              - if b->type = SETUP_LOOP and why = WHY_BREAK, set WHY_NOT and reset next_instr with b->handler, then break;
+              - if why = WHY_EXCEPTION and b->b_type = SETUP_EXCEPT || b->b_type = SETUP_FINALLY
+                 - call PyFrame_BlockSetup(f, EXCEPT_HANDLER, -1, STACKLEVEL()), allocate a new blockstack and set b_type = EXCEPT_HANDLER, 
+                   handler = -1 and level = STACKLEVEL()
+                 - push current exc_info into stack
+                 - call PyErr_Fetch to get exc = tstate->curexc_type, val = tstate->curexc_value, tb = tstate->curexc_traceback
+                 - call PyErr_NormalizeException(&exc, &val, &tb), it returns appropriate exception type and value
+                 - if tb != NULL, call PyException_SetTraceback(val,tb), otherwise call PyException_SetTraceback(val, Py_None)
+                 - update exc_info with exc, val and tb, push exc, val, tb into stack and JUMPTO(handler), and break;
+              - if b->b_type == SETUP_FINALLY, JUMPTO(b->b_handler)
+       - then we leave the main loop, we pop remaining stack entries, do tracing stuff, call Py_LeaveRecursiveCall, set f->f_executing = 0
+         set tstate->frame = f->f_back, and return _PyCheckFunctionResult(NULL, retval, "PyEval_EvalFrameEx") 
+
