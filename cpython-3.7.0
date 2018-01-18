@@ -151,7 +151,7 @@
     int co_firstlineno;      /* first source line number */
     PyObject *co_code;       /* instruction op code, bytes type */
     PyObject *co_const;      /* tuple for constants, any code object inside current code object will be listed here!!! */
-    PyObject *co_names;      /* tuple of strings, used function name? */
+    PyObject *co_names;      /* tuple of strings, like symbol table */
     PyObject *co_varnames;   /* tuple of strings of local variable names */
     PyObject *co_freevars;   /* tuple of strings of free variable names, free variable is a variable from an outer function */
     PyObject *co_cellvars;   /* tuple of strings of cell variable names, cell variable is a variable used by inner function */
@@ -223,6 +223,8 @@
   - module_init_dict pushes __name__, __doc__, __package__, __loader__, __spec__ into md_dict but only __name__
     has a value, others are NULL    
 
+* webpage regarding to sys module, https://docs.python.org/3.0/library/sys.html
+
 * typedef struct {
     PyModuleDefBase m_base; /* always initialize this member to PyModuleDef_HEAD_INIT */
     const_char *m_name;     /* name for the new module */
@@ -242,8 +244,8 @@
 
 * typedef struct PyModuleDefBase {
     PyObject_HEAD;
-    PyObject* (*m_init)(void);
-    Py_ssize_t m_index;
+    PyObject* (*m_init)(void);   /* seems like it saves initialize function for builtin modules? */
+    Py_ssize_t m_index;          /* = max_module_number++ */
     PyObject *m_copy;
   } PyModuleDef_Base;
 
@@ -269,7 +271,7 @@
     int dlopenflags;
     PyObject *builtins_copy;     /* Ex: a backup of builtins, in _PyImport_Init we see interp->builtins_copy = Pydict_copy(interp->builtins) */
     PyObject *import_func;       /* Ex: from initimport, interp->import_func = PyDictGetItemString(interp->builtins, "__import__") */
-    _PyFrameEvalFunction eval_frame;
+    _PyFrameEvalFunction eval_frame;   /* entry function to start running code */
     Py_ssize_t co_extra_user_count;
     freefunc co_extra_freefunc[MAX_CO_EXTRA_USERS];
     PyObject *before_forkers;
@@ -278,6 +280,30 @@
     void (*pyexitfunc)(PyObject *);
     PyObject *pyexitmodule; 
   } PyInterpreterState;
+
+* typedef struct _ts{
+    struct _ts *prev;
+    struct _ts *next;
+    PyInterpreterState *interp;
+    struct _frame *frame;
+    int recursion depth;
+    char overflowed;          /* the stack has overflowed, allow 50 more calls to handle the runtime error */
+    char recursion_critical;  /* the current calls must not cause a stack overflow */
+    int stackcheck_counter;
+    int tracing; /* tracing keeps track of the execution depth when tracing/profiling, to prevent the actual trace code from been recorded in trace/profile */
+    int use_tracing;
+    ... 
+  } PyThreadState;
+    - in _threadmodule.c, thread_methods[] has function thread_PyThread_start_new_thread as entry function
+       - struct bootstate is allocated and initialized, boot->tstate = _PyThreadState_Prealloc, in this function new_threadstate(interp, 0) is called
+       - then we call PyEval_InitThreads, the first call will create and take gil, second call will return directly
+       - call PyThread_start_new_thread(t_bootstrap, (void *) boot), this function calls pthread_create() and t_bootstrap is the entry function
+
+* t_bootstrap(void *boot_raw)
+    - call PyThreadState_Init(tstate), it then calls _PyGILState_NoteThreadState(tstate), not really understand what it does
+    - then it calls PyEval_AcquireThread(tstate) and it calls take_gil(tstate), this function uses conditional variable and timeout for GIL
+      scheduling, it may call SET_GIL_DROP_REQUEST()
+    - call tstate->interp->num_thread++, and then PyObject_Call(boot->func, boot->args, boot->keyw)  
 
 * Python's name resolution are determined after compiling and if follows local => enclosure => global (the module file) => builtins (intrisic)
 
@@ -304,6 +330,11 @@
      (a dict) and pass it into _PyImport_AddModuleObject(names, object), this function find the name from the module, or create a new module object 
      , set this new object into the module dict and return.
     - set __file__ = filename, __cached__ = None, and check if its a pyc file (call run_pyc_file), or call PyRun_FileExFlags 
+
+* '__main__' is the name of the scope in which top-level code executes. A module’s __name__ is set equal to '__main__' when read from standard input,
+   a script, or from an interactive prompt. A module can discover whether or not it is running in the main scope by checking its own __name__, which
+   allows a common idiom for conditionally executing code in a module when it is run as a script or with python -m but not when it is imported
+   from https://docs.python.org/3/library/__main__.html
 
 * PyRun_FileExFlags(FILE *fp, const char *filename_str, int start, PyObject *globals, PyObject *locals, int closeit, PyCompilerFlags *flags)    
     - it has mod_ty mod = PyParser_ASTFromFileObject(fp, filename, NULL, start, 0, 0, flags, NULL, arena), AST means Abstract Syntax Tree
@@ -369,3 +400,121 @@
        - then we leave the main loop, we pop remaining stack entries, do tracing stuff, call Py_LeaveRecursiveCall, set f->f_executing = 0
          set tstate->frame = f->f_back, and return _PyCheckFunctionResult(NULL, retval, "PyEval_EvalFrameEx") 
 
+* all python opcodes are at Include/opcode.h
+
+* the definition of dis.dis:
+   - [line number of the source code]  [the index of the bytecode for this instruction] [human-readable instruction name] [argument of the instr] [what the argument means]
+   - "LOAD_NAME 4" instruction loads co->co_names[4] into stack
+   - "LOAD_CONST 5" loads co->co_consts[5] into stack
+
+* LOAD_NAME
+   - if we call dis.dis('x'), then we got this LOAD_NAME instruction, in virtual machine we first call v = PyDict_GetItem(f->f_locals, name),
+     if v = NULL, then v = PyDict_GetItem(f->f_globals, name), if v = NULL then v = PyDict_GetItem(f->f_builtins, name), and PUSH(v) 
+
+* LOAD_GLOBAL
+   - similar to LOAD_NAME, we first read from global then from builtins
+
+* STORE_NAME
+   - when we call dis.dis('import x'), then we will get STORE_NAME after IMPORT_NAME
+   - this instruction tries to call PyDict_SetItem(f->f_locals, name, v), if fail then it calls PyObject_SetItem(f->f_locals, name, v)
+
+* import_name(PyFrameObject *f, PyObject *name, PyObject *from_list, PyObject *level)
+   - this is the entry function of instruction IMPORT_NAME for import xx statement
+   - get import_func = PyDict_GetItemId(f->builtins, &PyId___import__)
+   - if import_func = PyThreadState_GET()->interp->import_func, call PyImport_ImportModuleLevelObject(name, f->globals,
+     f->f_locals, from_list, level)
+      - call mod = PyImport_GetModule(absname), absname has been resolved as a valid argument, this function returns item from
+        interp->modules and then return PyDict_GetItemWithError(modules, name)
+      - if mod != NULL && != Py_None, we may call _PyObject_CallMethodIdObjArgs(interp->importlib, &PyId__lock_unlock_module, abs_name, NULL),
+        this function acutally calls _lock_unlock_module(...) 
+      - otherwise we call import_find_and_load(abs_name), and this function calls _PyObject_CallMethodIdObjArgs(interp->importlib, &PyId__find_and_load,
+        abs_name, interp->import_func, NULL), this function actually call _find_and_load(...)
+
+* import_from(PyObject *v, PyObject *name)
+   - call PyObject_GetAttr(v, name):
+      - return tp->tp_getattro(v, name) if tp->tp_getattro, otherwise if tp->tp_getattr return tp->tp_getattr(v, name)
+
+* from experiences, import Mod add Mod into sys.modules and main module's dict, from xxx import y also add y into main module's dict
+
+* typedef struct {
+    PyObject_HEAD;
+    PyObject *func_code;        /* a code object, the __code__ attribute */
+    PyObject *func_globals;     /* a dictionary (other mappings won't do) */
+    PyObject *func_defaults;    /* NULL or a tuple */
+    PyObject *func_kwdefaults;  /* NULL or a dict */
+    PyObject *func_closure;     /* NULL or a tuple, contains the bindings for func_code->co_freevars */
+    PyObject *func_doc;         /* the __doc__ attribute, can be anything */
+    PyObject *func_name;        /* the __name__ attribute, a string object */
+    PyObject *func_dict;        /* the __dict__ attribute, a dict or NULL */
+    PyObject *func_weakreflist  /* list of weak reference */
+    PyObject *func_module;      /* the __module__ attribute, can be anything */
+    PyObject *func_annotation;  /* Annotations, a dict or NULL */
+    PyObject *func_qualname;    /* the qualified name */
+  } PyFunctionObject;
+    - function objects are created by the execution of the 'def' statement
+    - there're three types in funcobject.c, PyClassMethod_Type, PyFunction_Type, PyStaticMethod_Type
+    - a static method does not receive an implicit first argument, this is similar to JAVA or C++
+    - a class method receives the class as its first argument, not similar to JAVA or C++
+
+* MAKE_FUNCTION
+    - this is the instruction when we call dis.dis('def f() ...'), and it calls PyFunc_NewWithQualName(codeobj, f->f_globals, qualname)
+      note that at this moment the codeobj has already been prepared 
+    - then we get ob = PyObject_GC_New(PyFunctionObject, &PyFunction_Type), and ob->func_code = code, ob->func_globals = f->f_globals,
+      ob->func_name = code->co_name, ob->func_doc PyTuple_GetItem(code->co_consts), ob->module = PyDict_GetItem(globals, __name__),
+      ob->qualname = qualname or ob->func_name 
+
+* CALL_FUNCTION
+  - this is the instruction when we call dis.dis('f()'), in ceval.c we have res = call_function(&sp, oparg, NULL) 
+     - if this function is PyCFunctionType, call _PyCFunction_FastCallKeywords(func, stack, nargs, kwnames), for builtin functions or methods,
+       always check this first because these are presumed to be called most frequently
+     - else if this function is PyMethodDescr_Type, generally we call _PyMethodDescr_FastCallKeywords(func, stack, nargs, kwnames), for
+       method descriptor
+     - else we call PyMethod_GET_FUNCTION(func) for bound method, or _PyFunction_FastCallKeywords(func, stack, nargs, kwnames) or 
+       _PyObject_FastCallKeywords(func, stack, nargs, kwnames)
+     - if the function we call is pure c function then we can directly process it, otherwise we will go to the virtual machine loop again 
+       
+* _PyFunction_FastCallKeywords(PyObject *func, PyObject *const *stack, Py_ssize_t nargs, PyObject *kwnames)
+   - we got code, globals, argdefs, kwdefs, closure, name, qualname from function object by calling PyFunction_GET_XXX
+   - then depending on whether this function has keywords and free variables or not, we call function_call_fastcall(co, stack, nargs, globals) or
+     _PyEval_EvalCodeWithName(co, globals, ..., closure, name, qualname)
+   - at function code, we don't use current globals but use function object's globals !     
+
+* LOAD_BUILD_CLASS
+   - this is the instruction to start building class
+   - it gets bc = f->builtins['__build_class__'] and push bc to stack
+   - it then do MAKE_FUNCTION to make a function object of class definition and push it to stack
+   - it then do LOAD_CONST, LOAD_NAME to push base classes and class name to stack
+   - it then do CALL_FUNCTION and call bc (builtin___build_class__) with argument in between
+      
+* builtin___build_class__(PyObject *self, PyObject * const *args, Py_ssize_t nargs, PyObject *kwnames)
+   - check from stack whether there's a metaclass, if no, then we get the type from first base class or use default PyType_Type
+   - if meta we got is really a class, call winner = PyType_CalculateMetaclass(meta, bases), this function check if there's a
+     metaclass conflict(derived class's type should be the subclass of its base class's type) and find the most derived metaclass
+     and we reassign meta = winner
+   - then we try to get __prepare__ atribute from meta, if it's NULL then we set ns = 0, otherwise ns = PyObject_FastCallDict(prep, pargs, 2,mkw)
+   - then we call cell = PyEval_EvalCodeEx(PyFunction_GET_CODE(func), PyFunction_GET_GLOBALS(func), ns, lots of 0, PyFunction_GET_CLOSURE(func))
+     the class's code object should run here and related function objects are created and saved into the local => ns
+   - it then calls _PyObject_FastCallDict(meta, margs, 3, mkw), where margs = {name, bases, ns} and mkw is the keywords on stack, and then this 
+     function calls meta->tp_call (type_call)
+
+* type_call(PyTypeObject *type, PyObject *args, PyObject *kwds)
+   - it calls type->tp_new(type, args, kwds), see below
+   
+* type_new(PyTypeObject *metatype, PyObject *args, PyObject *kwds)
+   - call PyArg_ParseTuple() and get name, bases and orig_dict
+   - recheck the proper meta type from bases and if found a better one, return winner->tp_new
+   - call base = best_base(bases), the first one which is on the path to "solid base"
+   - call dict = PyDict_Copy(orig_dict)
+   - check if __slot__ is inside the dict, if no, we update may_add_dict and may_add_weak, otherwise:
+      - first check if slots is allowed, base->tp_itemsize should be 0, then check the item in slots is valid
+      - then basically we create a list called slots and insert all valid items inside
+   - let type = metatype->tp_alloc(metatype, nslots), tp_alloc is PyType_GenericAlloc, it's changed in _PyReadyTypes, and a PyHeapTypeObject
+     is allocated (et), we can also cast it into PyTypeObject (type)
+   - then we start initialize each field, tp_flags, tp_as_xxx, tp_bases, tp_base, tp_dict, set __module__ in dict, set tp_doc, special cases
+     handling, ...
+   - then call PyType_Ready(type) 
+   - call fixup_slot_dispatcher(type), this function register a callback on such as tp_as_number.nb_add if the new type has __add__ method,
+     the callback function is written in MACRO, we can check such as slot_nb_add
+   - call set_names(type)
+   - call init_subclass(type,kwds)
+ 
