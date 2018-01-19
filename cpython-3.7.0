@@ -414,6 +414,19 @@
 * LOAD_GLOBAL
    - similar to LOAD_NAME, we first read from global then from builtins
 
+* LOAD_FAST
+   - load co->co_varnames[x] to stack
+
+* LOAD_CLOSURE
+   - push co->cellvars[x] to stack, this instruction is used the first instruction of the decorator, then we use MAKE_FUNCTION for the return
+
+* LOAD_DEREF
+   - I see this instruction when function use variable from decorator, and it load co->cellvars[x] (like LOAD_CLOSURE) but only push co->cellvars[x].ob_ref
+     to the stack, so called DEREF?
+
+* STORE_FAST
+   - co->co_varname[x] = value
+
 * STORE_NAME
    - when we call dis.dis('import x'), then we will get STORE_NAME after IMPORT_NAME
    - this instruction tries to call PyDict_SetItem(f->f_locals, name, v), if fail then it calls PyObject_SetItem(f->f_locals, name, v)
@@ -457,11 +470,14 @@
     - a class method receives the class as its first argument, not similar to JAVA or C++
 
 * MAKE_FUNCTION
+    - this instruction creates a new function object
     - this is the instruction when we call dis.dis('def f() ...'), and it calls PyFunc_NewWithQualName(codeobj, f->f_globals, qualname)
       note that at this moment the codeobj has already been prepared 
     - then we get ob = PyObject_GC_New(PyFunctionObject, &PyFunction_Type), and ob->func_code = code, ob->func_globals = f->f_globals,
       ob->func_name = code->co_name, ob->func_doc PyTuple_GetItem(code->co_consts), ob->module = PyDict_GetItem(globals, __name__),
       ob->qualname = qualname or ob->func_name 
+    - this instruction will check oparg on stack and if oparg = 0x8, we set func->func_closure = POP(); oparg =0x4 we set func->func_annotation;
+      oparg = 0x2 we set func->func_kwdefaults = POP(); oparg = 0x1 we set func->func_default = POP()
 
 * CALL_FUNCTION
   - this is the instruction when we call dis.dis('f()'), in ceval.c we have res = call_function(&sp, oparg, NULL) 
@@ -473,6 +489,12 @@
        _PyObject_FastCallKeywords(func, stack, nargs, kwnames)
      - if the function we call is pure c function then we can directly process it, otherwise we will go to the virtual machine loop again 
        
+* YIELD_VALUE
+     - this is the instruction I can see in generator
+     - set retval = POP()
+     - it checks if the co->co_flags & CO_ASYNC_GENERATOR(0x0200), if yes, retval = _PyAsyncGenValueWrapperNew(retval)
+     - set f->stacktop = stack_pointer, why = WHY_YIELD, and goto fast_yield
+
 * _PyFunction_FastCallKeywords(PyObject *func, PyObject *const *stack, Py_ssize_t nargs, PyObject *kwnames)
    - we got code, globals, argdefs, kwdefs, closure, name, qualname from function object by calling PyFunction_GET_XXX
    - then depending on whether this function has keywords and free variables or not, we call function_call_fastcall(co, stack, nargs, globals) or
@@ -517,4 +539,47 @@
      the callback function is written in MACRO, we can check such as slot_nb_add
    - call set_names(type)
    - call init_subclass(type,kwds)
- 
+
+* metaclass is triggered using class C(object, metaclass=x) 
+
+* typedef struct {
+    PyObject_HEAD;
+    sturct _frame *gi_frame; /* this can be NULL if the generator is finished */
+    char gi_running;         /* true if generator is being executed */
+    PyObject *gi_code;       /* the code object backing the generator */
+    PyObject *gi_weakref;    /* list of weak reference */
+    PyObject *gi_name;       /* the name of the generator */
+    PyObject *gi_qualname;   /* qualified name of the generator */
+    _PyErr_StackItem gi_exc_state;
+  } PyGenObject;
+
+* how is the call tree when we call next(gen)
+   - next is a builtin method and LOAD_NAME will load it into stack
+   - we run CALL_FUNCTION and it calls call_function
+   - next is a C function ans it calls builtin_next, it then calls (*gen->ob_type->iternext)(gen)
+   - then it calls gen_send_ex and it calls PyEval_EvalFrameEx ans it goes _PyEval_EvalFrameDefault(f, exc)
+     where f is the frameobject on the generator object, and then the bytecode instruction starts executing
+
+* typedef struct {
+    PyObject_Head;
+    PyObject *start, *stop, *step; /* not NULL */
+  } PySliceObject;
+
+* BUILD_SLICE
+   - this is the instruction I can see in dis.dis('a[1:3]')
+   - its oparg determines whether step is there, and it calls PySlice_New(start, stop, step), and put it at top  
+   - then the next instuction is BINARY_SUBSCR
+
+* BINARY_SUBSCR
+   - this instruction gets sub, and container from stack, and then calls PyObject_GetItem(container, sub) and put result at top
+   - which mean the container should handler the slice object itself
+
+* LOAD_ATTR
+   - this instruction can be shown in dis.dis('a.b.c=1'), and it does as following: LOAD_CONST (1), LOAD_NAME(a), LOAD_ATTR(b),
+     STORE_ATTR(c) ...
+   - call GETITEM(name, oparg), where names = co->co_names, then gets owner using TOP() and call PyObject_GetAttr(owner, name)
+   - first check tp->getattro, then tp->getattr
+
+* STORE_ATTR
+   - very similar to LOAD_ATTR, call GETITEM(names, oparg) and get owner using TOP() and call PyObject_SetAttr(owner, name, v) 
+   - first check tp->setattro, and then tp_setattr
