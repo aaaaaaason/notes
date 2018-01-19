@@ -150,11 +150,12 @@
     int co_flags;            /* use dis.COMPILER_FLAG_NAME, 1: OPTIMIZED, 2:NEWLOCALS, 4:VARARGS, 8:VARKEYWORDS, 16:NESTED, 32:GENERATOR, ...*/
     int co_firstlineno;      /* first source line number */
     PyObject *co_code;       /* instruction op code, bytes type */
-    PyObject *co_const;      /* tuple for constants, any code object inside current code object will be listed here!!! */
-    PyObject *co_names;      /* tuple of strings, like symbol table */
-    PyObject *co_varnames;   /* tuple of strings of local variable names */
+    PyObject *co_consts;     /* tuple for constants, any code object inside current code object will be listed here!!! */
+    PyObject *co_names;      /* tuple of strings, like symbol table, used for such as LOAD_NAME or STORE_NAME instructions, if
+                                the compiled result needs to operate a name, then the name should be here */
+    PyObject *co_varnames;   /* tuple of strings of local variable names, used for such as LOAD_FAST or STORE_FAST instruction */
     PyObject *co_freevars;   /* tuple of strings of free variable names, free variable is a variable from an outer function */
-    PyObject *co_cellvars;   /* tuple of strings of cell variable names, cell variable is a variable used by inner function */
+    PyObject *co_cellvars;   /* tuple of strings of cell variable names, cell variable is a variable used by inner function, used by LOAD_CLOSURE */
     /* The rest aren't used in either hash or comparisons, except for co_name used in both */
     Py_ssize_t *co_cell2arg; /* Map cellvars which are arguments, a pointer to an array and each entry stores the index in total arguments */
     PyObject *co_filename;   /* unicode (where it was loaded from) */
@@ -212,7 +213,7 @@
 
 * typedef struct {
     PyObject_HEAD;           
-    PyObject *md_dict;           /* __dict__ of this module */ 
+    PyObject *md_dict;           /* __dict__ of this module, contains all objects under this module, dir(module) = module.__dict__.keys() */ 
     struct PyModuleDef *md_def;  /* initialized and set in _PyModule_CreateInitialized, */
     void *md_state;              /* points to a memory space with size = md_def->m_size, each module has its usage */
     PyObject *md_weaklist;
@@ -221,8 +222,9 @@
   - PyModule_New calls PyModule_NewObject(nameobj) and it creates a PyModuleObject based on PyModule_Type, then
     it sets md_def, md_state, md_weaklist, md_name as NULL, but call module_init_dict for md_dict
   - module_init_dict pushes __name__, __doc__, __package__, __loader__, __spec__ into md_dict but only __name__
-    has a value, others are NULL    
-
+    has a value, others are NULL
+  - we can treat a module as a file grouped with related objects, this whole module is global and function scope is local 
+   
 * webpage regarding to sys module, https://docs.python.org/3.0/library/sys.html
 
 * typedef struct {
@@ -336,6 +338,10 @@
    allows a common idiom for conditionally executing code in a module when it is run as a script or with python -m but not when it is imported
    from https://docs.python.org/3/library/__main__.html
 
+* based on above, the script file (it's a module) or interative prompt is set to '__main__' module, we work under this module and so we don't need to
+  use modulename.A to reference the A object, and if we call dir() (returns the names of current scope) then this equals to sys.modules['__main__'].__dict__.keys()
+  and this equal to sys._getframe().f_locals.keys() = sys._getframe().f_globals.keys()  
+
 * PyRun_FileExFlags(FILE *fp, const char *filename_str, int start, PyObject *globals, PyObject *locals, int closeit, PyCompilerFlags *flags)    
     - it has mod_ty mod = PyParser_ASTFromFileObject(fp, filename, NULL, start, 0, 0, flags, NULL, arena), AST means Abstract Syntax Tree
     - call run_mod(mod, filename, globals, locals, flags, arena)
@@ -408,24 +414,26 @@
    - "LOAD_CONST 5" loads co->co_consts[5] into stack
 
 * LOAD_NAME
-   - if we call dis.dis('x'), then we got this LOAD_NAME instruction, in virtual machine we first call v = PyDict_GetItem(f->f_locals, name),
-     if v = NULL, then v = PyDict_GetItem(f->f_globals, name), if v = NULL then v = PyDict_GetItem(f->f_builtins, name), and PUSH(v) 
+   - if we call dis.dis('x'), then we got this LOAD_NAME instruction, in virtual machine we first call read name from co->co_names using oparg, then 
+     v = PyDict_GetItem(f->f_locals, name), if v = NULL, then v = PyDict_GetItem(f->f_globals, name), if v = NULL then
+     v = PyDict_GetItem(f->f_builtins, name), and PUSH(v) 
 
 * LOAD_GLOBAL
    - similar to LOAD_NAME, we first read from global then from builtins
 
 * LOAD_FAST
-   - load co->co_varnames[x] to stack
+   - value = GETLOCAL(oparg), which means fastlocals[oparg] or f->f_localsplus, then we push value to stack
 
 * LOAD_CLOSURE
-   - push co->cellvars[x] to stack, this instruction is used the first instruction of the decorator, then we use MAKE_FUNCTION for the return
+   - push freevars[x] to stack, this instruction is used the first instruction of the decorator, then we use MAKE_FUNCTION for the return
+   - freevars = f->f_localsplus + co->nlocals and freevars[] first allocate co_cellvars and then co_freevars
 
 * LOAD_DEREF
-   - I see this instruction when function use variable from decorator, and it load co->cellvars[x] (like LOAD_CLOSURE) but only push co->cellvars[x].ob_ref
-     to the stack, so called DEREF?
+   - I see this instruction when function use variable from decorator, and it loads cell = freevars[x] but only push cell->ob_ref to stack 
+   - freevars = f->f_localsplus + co->nlocals and freevars[] first allocate co_cellvats and then co_freevars
 
 * STORE_FAST
-   - co->co_varname[x] = value
+   - pop the value from stack and call SETLOCAL(oparg, value), like LOAD_FAST, f->f_localsplus[oparg] = value
 
 * STORE_NAME
    - when we call dis.dis('import x'), then we will get STORE_NAME after IMPORT_NAME
@@ -583,3 +591,19 @@
 * STORE_ATTR
    - very similar to LOAD_ATTR, call GETITEM(names, oparg) and get owner using TOP() and call PyObject_SetAttr(owner, name, v) 
    - first check tp->setattro, and then tp_setattr
+
+* POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE   
+   - let cond = POP() and check if cond == Py_True or Py_False to decide whether do JUMPTO(oparg)  
+
+* JUMP_FORWARD
+   - directly do JUMPBY(oparg)
+
+* SETUP_LOOP/SETUP_EXCEPT/SETUP_FINALLY
+   - only call PyFrame_BlockSetup(f, opcode, INSTR_OFFSET() + oparg, STACK_LEVEL())
+   - INSTR_OFFSET() is next_instr - first_instr, STACK_LEVEL() is stack_pointer - f->valuestack
+   - PyFrame_BlockSetup(PyFrameObject *f, int type, int handler, int level)
+   - this function set b = f->f_blockstack[f->f_iblock++], and set b->b_type = type, b->b_level = level, b->b_handler = handler
+   - handler is used to jump to the 'handler' and level is used to unwind stack, we don't know when the exception may occur, stack needs
+     to be cleaned up
+   - bytecode pattern: SETUP FINALLY -> SETUP EXCEPT -> try block -> POP BLOCK -> JUMP_FORWARD (FINALLY) -> except block -> POP_EXCEPT ->
+     POP_BLOCK -> finally block 
