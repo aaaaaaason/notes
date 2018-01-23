@@ -1,0 +1,70 @@
+* Some notes I don't remember already or don't know
+
+* for(auto &i : sequence), range-based for loop
+* auto can be the return type of a function.
+* initializer list {} can be helpful for implicit type conversion.
+* constexpr can be a constant function, and it can be used as a constructor. compiler will try to
+  evaluate those functions and insert their result instead of inserting instructions.
+* default constructor is the constructor without any argument, so a constructor with all default parameters is
+  default constructor too, there's only one default constructor. 
+* private copy constructor and private assignment operator for non-copyable obejcts, only
+  declaration is okay.
+* with private constructor, private assignment operator and static get instance method for singleton.
+* private destuctor can be used to forbid the object creation on stack, the use case is that this object is 
+  too large to put into stack and can only be in heap. then we have to create another public (static?) 
+  member function for object destroy.
+* use explicit for single valued constructor to forbid implicit type conversion, the case is that:
+   - void DoSomething(Human person)
+   - Human(int age): myAge(age)
+   - then DoSomethin(15) can work if no explicit keyword before the constructor
+* sizeof(class) shows the sum of bytes consumed by each data attribute contained within the class. it might
+  or might not include padding depending on the compiler.
+* struct is a class with public members and public inheritance by default.
+* declare a class or a function use friend keyword in class can let friends to access its private members 
+* the members of a union are public by default. Union cannot be used in inheritance.
+* public inheritance is is-a relationship, protected and private are has-a relationship
+   - base class Motor, derived class Car (car has a motor)
+   - some said private inheritance as "is implemented in terms of" relationship, we can check
+     http://www.bogotobogo.com/cplusplus/private_inheritance.php, it said using composition as we can,
+     only use private inheritance when we have to.
+   - only use protected inheriance when we have to 
+* one derived class overloaded method can hide all overloaded methods in base class, the solution is:
+   - use the scope resolution operator instance.Base::Method()
+   - add using Base::Method in the derived class
+   - write overload methods for all base class 
+* order of construction: base class members -> base class constructor -> derived class members -> derived 
+  class constructor
+* order of desturction: inverse of construction   
+* when doing Base objectBase = objectDerived, only the base part will be copied, is called slicing.
+* using class Xxx final : public Base1, public Base2 ... for a derived class cannot be further derived
+* use virtual keyword to call derived class' methods when we are hold by a base type, otherwise the base
+  case method will be called 
+* use virtual destructors to ensure thant destuctors in derived classes are invoked when deleting a pointer
+  of type Base*, thus always declare the base class destuctor as virtual  
+* each class instance has a pointer to virtual function table if this class has virtual methods, then when
+  this object is called on runtime, we can still find the correct virtual function by referencing the table,
+  this table are array of function pointers and it can points to functions in base classes or derived classes.
+  we can check the existance of this virtual function table pointer using sizeof(class)
+* a virtual method is said to be pure virtual by declaring virtual void foo() = 0;
+* use virtual inheritance to solve multiple inheritances of the same base class
+* use override to make sure we actually overiden the virtual function in base class
+   - void foo() override
+* use final on function to prevent overriding
+   - void foo() override final
+* there's no virtual copy constructors and below are possible reasons:
+   - we cannot have a virtual copy constructor because we cannot lookup table before the instance is created   
+   - constructors are not polymorphic in nature as they can construct only a fixed type
+* postfix increment method has value return type and int parameter, prefix increment methos has reference return
+  type and no parameter   
+* conversion operator is used as "explicit operator const char* ()", then we need static_cast<> for conversion 
+* the binary add/sub has prototype "Foo operator + (A) {}"
+* Type& operator += (T t) for addition assignment (this book use void as return value)
+* bool operator == (const Foo& compareTo), and operator != () {returns !(*this == compareTo);}, operator <, <=,
+  >, >= are similar.
+* copy assignment operator: Foo& operator = (const Foo& copySource), needs if (this != &copySource)
+* self made copy constructor, destructor and copy assignment are required at the same time (when you need 
+  dynamic allocated resource)
+* subscript operator: Foo& operator [] (int index) {} 
+* function operator: don't have a rule
+* move constructor and move assignment operator use Foo&& as input parameter, it will be called when rvalue is
+  passed, use it to optimize the time/space when doing deep copy. 
